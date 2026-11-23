@@ -17,7 +17,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument, Message, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -51,7 +51,8 @@ PAGE_SIZE = 8
 
 # Canal privé où l'index (la base SQLite) est sauvegardé, indispensable sur
 # GitHub Actions car le disque du runner est effacé à chaque exécution.
-INDEX_CHANNEL = (parse_ids(os.environ.get("CHANNEL_INDEX", "")) or [None])[0]
+_index_ids = parse_ids(os.environ.get("CHANNEL_INDEX", ""))
+
 # Durée max d'une exécution en minutes (0 = illimité, pour un PC ou un VPS).
 MAX_RUNTIME_MIN = int(os.environ.get("MAX_RUNTIME_MIN", "0") or 0)
 BACKUP_EVERY_S = 30
@@ -65,9 +66,21 @@ CATEGORIES = {
 }
 
 
+def as_channel_id(value: int) -> int:
+    """Un ID de canal commence toujours par -100. On répare les formes courantes :
+    1234567890 ou -1234567890 (copié depuis l'URL de web.telegram.org) → -1001234567890."""
+    text = str(value)
+    if text.startswith("-100"):
+        return value
+    return int("-100" + text.lstrip("-"))
+
+
+INDEX_CHANNEL = as_channel_id(_index_ids[0]) if _index_ids else None
+
+
 def channel_of(cat: str) -> int | None:
     ids = parse_ids(os.environ.get(CATEGORIES[cat][1], ""))
-    return ids[0] if ids else None
+    return as_channel_id(ids[0]) if ids else None
 
 
 GAME_EXT = {".apk", ".xapk", ".exe", ".msi", ".iso", ".zip", ".rar", ".7z", ".nsp", ".xci", ".cia", ".pkg"}
@@ -292,7 +305,7 @@ def main_menu() -> tuple[str, InlineKeyboardMarkup]:
         "• 📤 <b>Envoyer</b> : choisis la catégorie, puis envoie tes fichiers.\n"
         "• Ou envoie directement un fichier, je te demanderai où le ranger.\n"
         "• Clique sur une catégorie pour parcourir.\n"
-        "• <code>/search mot</code> pour chercher.\n\n"
+        "• <code>/search mot</code> pour chercher, /check pour tester les canaux.\n\n"
         + (f"📥 Envoi en cours vers : {CATEGORIES[target][0]}\n" if target in CATEGORIES else "")
         + f"Mode auto : {'✅ activé' if auto else '❌ désactivé'} (/auto)"
     )
@@ -329,13 +342,22 @@ async def store_file(context: ContextTypes.DEFAULT_TYPE, row_id: int, cat: str) 
     caption = (
         f"#{cat}\n📄 {html.escape(row['file_name'])}\n💾 {human_size(row['size_bytes'])}"
     )
-    copied = await context.bot.copy_message(
-        chat_id=channel,
-        from_chat_id=row["src_chat_id"],
-        message_id=row["src_message_id"],
-        caption=caption,
-        parse_mode=ParseMode.HTML,
-    )
+    try:
+        copied = await context.bot.copy_message(
+            chat_id=channel,
+            from_chat_id=row["src_chat_id"],
+            message_id=row["src_message_id"],
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+    except (BadRequest, Forbidden) as exc:
+        return (
+            f"❌ Impossible d'envoyer dans {CATEGORIES[cat][0]} : <i>{html.escape(exc.message)}</i>\n\n"
+            f"ID utilisé : <code>{channel}</code>\n"
+            "Vérifie que le bot est <b>administrateur</b> de ce canal et que l'ID est le bon. "
+            "Tape /check pour tester tous les canaux. Ton fichier reste en attente : "
+            "renvoie-le une fois corrigé."
+        )
     with db() as conn:
         conn.execute(
             "UPDATE files SET status='done', category=?, channel_id=?, message_id=? WHERE id=?",
@@ -577,6 +599,32 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                               parse_mode=ParseMode.HTML)
 
 
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Teste l'accès du bot à chaque canal configuré."""
+    me = await context.bot.get_me()
+    targets = [(CATEGORIES[k][0], CATEGORIES[k][1], channel_of(k)) for k in CATEGORIES]
+    targets.append(("🗂 Index", "CHANNEL_INDEX", INDEX_CHANNEL))
+    lines = ["🔧 <b>Test des canaux</b>\n"]
+    for label, secret, cid in targets:
+        if cid is None:
+            lines.append(f"⚪ {label} : secret <code>{secret}</code> vide")
+            continue
+        try:
+            chat = await context.bot.get_chat(cid)
+            member = await context.bot.get_chat_member(cid, me.id)
+            if member.status == "administrator":
+                lines.append(f"✅ {label} : « {html.escape(chat.title or '')} » (admin)")
+            else:
+                lines.append(f"⚠️ {label} : « {html.escape(chat.title or '')} », mais le bot n'est pas admin")
+        except TelegramError as exc:
+            lines.append(f"❌ {label} : <code>{cid}</code> → {html.escape(exc.message)}")
+    lines.append(
+        "\nSi un canal est en ❌ : ajoute @" + html.escape(me.username or "ton_bot")
+        + " comme administrateur du canal, puis écris /id dans le canal pour avoir le bon ID."
+    )
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Message privé d'un compte non autorisé : on lui donne son ID au lieu de rester muet."""
     await update.effective_message.reply_text(
@@ -627,6 +675,7 @@ def main() -> None:
     app.add_handler(CommandHandler("menu", cmd_start, filters=owner))
     app.add_handler(CommandHandler("auto", cmd_auto, filters=owner))
     app.add_handler(CommandHandler("search", cmd_search, filters=owner))
+    app.add_handler(CommandHandler("check", cmd_check, filters=owner))
     app.add_handler(MessageHandler(owner & filters.ATTACHMENT, on_file))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, cmd_start))  # "salut" → menu
