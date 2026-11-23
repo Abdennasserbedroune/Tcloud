@@ -10,6 +10,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime
 
@@ -38,13 +39,19 @@ log = logging.getLogger("tgstore")
 # ---------------------------------------------------------------- config
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_IDS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",") if x}
+def parse_ids(raw: str) -> list[int]:
+    """Extrait tous les nombres d'une valeur, même mal formatée
+    (espaces, guillemets, retour à la ligne, "OWNER_IDS=123"...)."""
+    return [int(x) for x in re.findall(r"-?\d{5,}", raw or "")]
+
+
+OWNER_IDS = set(parse_ids(os.environ.get("OWNER_IDS", "")))
 DB_PATH = os.environ.get("DB_PATH", "tgstore.db")
 PAGE_SIZE = 8
 
 # Canal privé où l'index (la base SQLite) est sauvegardé, indispensable sur
 # GitHub Actions car le disque du runner est effacé à chaque exécution.
-INDEX_CHANNEL = int(os.environ["CHANNEL_INDEX"]) if os.environ.get("CHANNEL_INDEX") else None
+INDEX_CHANNEL = (parse_ids(os.environ.get("CHANNEL_INDEX", "")) or [None])[0]
 # Durée max d'une exécution en minutes (0 = illimité, pour un PC ou un VPS).
 MAX_RUNTIME_MIN = int(os.environ.get("MAX_RUNTIME_MIN", "0") or 0)
 BACKUP_EVERY_S = 30
@@ -59,8 +66,8 @@ CATEGORIES = {
 
 
 def channel_of(cat: str) -> int | None:
-    value = os.environ.get(CATEGORIES[cat][1], "").strip()
-    return int(value) if value else None
+    ids = parse_ids(os.environ.get(CATEGORIES[cat][1], ""))
+    return ids[0] if ids else None
 
 
 GAME_EXT = {".apk", ".xapk", ".exe", ".msi", ".iso", ".zip", ".rar", ".7z", ".nsp", ".xci", ".cia", ".pkg"}
@@ -570,6 +577,17 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                               parse_mode=ParseMode.HTML)
 
 
+async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Message privé d'un compte non autorisé : on lui donne son ID au lieu de rester muet."""
+    await update.effective_message.reply_text(
+        "⛔ Ce bot est privé.\n"
+        f"Ton ID Telegram : <code>{update.effective_user.id}</code>\n\n"
+        "Si c'est ton bot, mets exactement ce nombre dans le secret GitHub OWNER_IDS, "
+        "puis relance le workflow.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def channel_id_helper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Écris /id dans un canal où le bot est admin : il répond avec l'ID du canal."""
     post = update.channel_post
@@ -611,9 +629,15 @@ def main() -> None:
     app.add_handler(CommandHandler("search", cmd_search, filters=owner))
     app.add_handler(MessageHandler(owner & filters.ATTACHMENT, on_file))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, cmd_start))  # "salut" → menu
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~owner, deny))
     app.add_error_handler(on_error)
 
-    log.info("Bot démarré.")
+    configured = [k for k in CATEGORIES if channel_of(k) is not None]
+    log.info(
+        "Bot démarré : %d propriétaire(s) autorisé(s), canaux configurés : %s, index : %s.",
+        len(OWNER_IDS), ", ".join(configured) or "aucun", "oui" if INDEX_CHANNEL else "non",
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
