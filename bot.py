@@ -193,12 +193,15 @@ async def post_init(app: Application) -> None:
     await restore_index(app)
     init_db()
     await backup_index(app, new_message=True)  # point de sauvegarde de début d'exécution
-    app.create_task(backup_loop(app))
+    # asyncio.create_task : la boucle tourne déjà ici (évite le PTBUserWarning)
+    app.bot_data["tasks"] = [asyncio.create_task(backup_loop(app))]
     if MAX_RUNTIME_MIN > 0:
-        app.create_task(stop_after(app, MAX_RUNTIME_MIN))
+        app.bot_data["tasks"].append(asyncio.create_task(stop_after(app, MAX_RUNTIME_MIN)))
 
 
 async def post_stop(app: Application) -> None:
+    for task in app.bot_data.get("tasks", []):
+        task.cancel()
     if app.bot_data.get("dirty"):
         await backup_index(app)
         log.info("Index sauvegardé avant l'arrêt.")
@@ -274,15 +277,30 @@ def main_menu() -> tuple[str, InlineKeyboardMarkup]:
             line = []
     if line:
         rows.append(line)
+    rows.insert(0, [InlineKeyboardButton("📤 Envoyer des fichiers", callback_data="send")])
     auto = get_setting("auto", "0") == "1"
+    target = get_setting("target", "")
     text = (
         "📦 <b>Ton stockage</b>\n\n"
-        "• Envoie-moi un fichier pour le ranger.\n"
-        "• Choisis une catégorie pour parcourir.\n"
+        "• 📤 <b>Envoyer</b> : choisis la catégorie, puis envoie tes fichiers.\n"
+        "• Ou envoie directement un fichier, je te demanderai où le ranger.\n"
+        "• Clique sur une catégorie pour parcourir.\n"
         "• <code>/search mot</code> pour chercher.\n\n"
-        f"Mode auto : {'✅ activé' if auto else '❌ désactivé'} (/auto)"
+        + (f"📥 Envoi en cours vers : {CATEGORIES[target][0]}\n" if target in CATEGORIES else "")
+        + f"Mode auto : {'✅ activé' if auto else '❌ désactivé'} (/auto)"
     )
     return text, InlineKeyboardMarkup(rows)
+
+
+def send_menu() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label, callback_data=f"target:{key}")]
+            for key, (label, _) in CATEGORIES.items()]
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def done_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✋ Terminer l'envoi", callback_data="target:off")]])
 
 
 # ---------------------------------------------------------------- rangement
@@ -347,6 +365,12 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mark_dirty(context)
 
     guess = detect_category(info["name"], info["mime"])
+
+    target = get_setting("target", "")
+    if target in CATEGORIES:  # catégorie choisie avant l'envoi
+        await msg.reply_text(await store_file(context, row_id, target),
+                             parse_mode=ParseMode.HTML, reply_markup=done_button())
+        return
 
     if get_setting("auto", "0") == "1":
         await msg.reply_text(await store_file(context, row_id, guess), parse_mode=ParseMode.HTML)
@@ -451,6 +475,26 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif action == "up" and args[0] in CATEGORIES:
         result = await store_file(context, int(args[1]), args[0])
         await query.edit_message_text(result, parse_mode=ParseMode.HTML)
+
+    elif action == "send":
+        await query.edit_message_text("📤 Dans quelle catégorie veux-tu envoyer ?", reply_markup=send_menu()) \
+            if query.message.text else await query.message.reply_text(
+                "📤 Dans quelle catégorie veux-tu envoyer ?", reply_markup=send_menu())
+
+    elif action == "target":
+        if args[0] in CATEGORIES:
+            set_setting("target", args[0])
+            mark_dirty(context)
+            await query.edit_message_text(
+                f"📥 OK, envoie tes fichiers : ils iront tous dans {CATEGORIES[args[0]][0]}.\n"
+                "Tu peux en envoyer plusieurs d'un coup.",
+                reply_markup=done_button(),
+            )
+        else:
+            set_setting("target", "")
+            mark_dirty(context)
+            text, kb = main_menu()
+            await query.message.reply_text("✋ Envoi terminé.\n\n" + text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
     elif action == "cancel":
         with db() as conn:
